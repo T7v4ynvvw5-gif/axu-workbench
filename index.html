@@ -392,6 +392,144 @@ const Store = {
   save(){ localStorage.setItem('wb_config', JSON.stringify(this.cfg)); }
 };
 
+/* ==================== 云端同步（Supabase REST API）==================== */
+const Sync = {
+  client: null, // {url, key}
+  
+  init(){
+    const s = Store.cfg.settings;
+    if(s.cloudConnected && s.supabaseUrl && s.supabaseKey){
+      this.client = { url: s.supabaseUrl, key: s.supabaseKey };
+    }
+  },
+  
+  headers(){
+    return { 'apikey': this.client.key, 'Authorization': `Bearer ${this.client.key}`, 'Content-Type': 'application/json', 'Prefer': 'return=representation' };
+  },
+  
+  // 创建数据表（通过 Supabase 的 SQL Editor 不能用 REST API，所以用 upsert 自动建表的方式）
+  // Supabase 的 REST API 不支持 DDL，需要用户在 SQL Editor 执行建表语句
+  // 我们用 /rest/v1/ 端点测试连接
+  async test(){
+    if(!this.client) return false;
+    try{
+      const r = await fetch(`${this.client.url}/rest/v1/`, { headers: this.headers() });
+      return r.ok || r.status === 400 || r.status === 404;
+    }catch(e){ return false; }
+  },
+  
+  // 上传配置（categories/settings/inspire）
+  async uploadConfig(){
+    if(!this.client) return;
+    try{
+      // 用 upsert 到 wb_config 表（单行，id=1）
+      await fetch(`${this.client.url}/rest/v1/wb_config?id=eq.1`, {
+        method: 'DELETE', headers: this.headers()
+      });
+      await fetch(`${this.client.url}/rest/v1/wb_config`, {
+        method: 'POST',
+        headers: this.headers(),
+        body: JSON.stringify({ id: 1, data: Store.cfg, updated_at: new Date().toISOString() })
+      });
+    }catch(e){ console.warn('上传配置失败', e); }
+  },
+  
+  // 拉取配置
+  async pullConfig(){
+    if(!this.client) return null;
+    try{
+      const r = await fetch(`${this.client.url}/rest/v1/wb_config?id=eq.1&select=data`, { headers: this.headers() });
+      const j = await r.json();
+      return (j && j.length) ? j[0].data : null;
+    }catch(e){ return null; }
+  },
+  
+  // 上传所有任务数据
+  async uploadAll(){
+    if(!this.client) return;
+    const tasks = await DB.allTasks();
+    const daily = await DB.allDaily();
+    // 上传 tasks
+    await fetch(`${this.client.url}/rest/v1/wb_tasks?user_id=eq.1`, { method:'DELETE', headers: this.headers() });
+    if(tasks.length){
+      const rows = tasks.map(t => ({ id: t.id, data: t, updated_at: t.updatedAt || new Date().toISOString() }));
+      await fetch(`${this.client.url}/rest/v1/wb_tasks`, { method:'POST', headers: this.headers(), body: JSON.stringify(rows) });
+    }
+    // 上传 daily
+    await fetch(`${this.client.url}/rest/v1/wb_daily?user_id=eq.1`, { method:'DELETE', headers: this.headers() });
+    if(daily.length){
+      const rows = daily.map(d => ({ key: d.key, data: d, updated_at: new Date().toISOString() }));
+      await fetch(`${this.client.url}/rest/v1/wb_daily`, { method:'POST', headers: this.headers(), body: JSON.stringify(rows) });
+    }
+    await this.uploadConfig();
+    Store.cfg.settings.lastSyncAt = new Date().toISOString();
+    Store.save();
+  },
+  
+  // 拉取所有数据并合并到本地
+  async pullAll(){
+    if(!this.client) return;
+    // 拉配置
+    const remoteCfg = await this.pullConfig();
+    if(remoteCfg){
+      // 合并：远程配置覆盖本地（保留本地 Supabase 连接设置）
+      const localSb = { ...Store.cfg.settings };
+      Store.cfg = { ...remoteCfg, settings: { ...remoteCfg.settings, ...localSb } };
+      Store.save();
+    }
+    // 拉任务
+    const r1 = await fetch(`${this.client.url}/rest/v1/wb_tasks?select=data`, { headers: this.headers() });
+    const tasks = await r1.json();
+    if(tasks && tasks.length){
+      for(const row of tasks){ if(row.data) await DB.putTask(row.data); }
+    }
+    // 拉 daily
+    const r2 = await fetch(`${this.client.url}/rest/v1/wb_daily?select=data`, { headers: this.headers() });
+    const daily = await r2.json();
+    if(daily && daily.length){
+      for(const row of daily){ if(row.data) await DB.putDaily(row.data); }
+    }
+  },
+  
+  // 单条任务同步
+  async syncTask(task){
+    if(!this.client) return;
+    try{
+      await fetch(`${this.client.url}/rest/v1/wb_tasks`, {
+        method: 'POST',
+        headers: { ...this.headers(), 'Prefer': 'resolution=merge-duplicates' },
+        body: JSON.stringify({ id: task.id, data: task, updated_at: task.updatedAt || new Date().toISOString() })
+      });
+    }catch(e){}
+  },
+  
+  // 生成建表 SQL（给用户复制粘贴到 Supabase SQL Editor）
+  schemaSQL(){
+    return `-- AXU工作台 建表SQL（复制到 Supabase SQL Editor 执行）
+CREATE TABLE IF NOT EXISTS wb_config (
+  id INT PRIMARY KEY DEFAULT 1,
+  data JSONB,
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS wb_tasks (
+  id TEXT PRIMARY KEY,
+  data JSONB,
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS wb_daily (
+  key TEXT PRIMARY KEY,
+  data JSONB,
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE wb_config ENABLE ROW LEVEL SECURITY;
+ALTER TABLE wb_tasks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE wb_daily ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "anon all" ON wb_config FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);
+CREATE POLICY "anon all" ON wb_tasks FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);
+CREATE POLICY "anon all" ON wb_daily FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);`;
+  }
+};
+
 /* IndexedDB 任务数据 */
 const DB = {
   db: null,
@@ -469,10 +607,13 @@ const App = {
     $('#addCatBtn').innerHTML = ico('plus',18);
     $('#settingsBtn').innerHTML = ico('settings',21);
     $('#syncIco').innerHTML = ico('refresh',14);
+    Sync.init();
     this.updateStatus();
     this.renderSidebar();
     // 默认选中第一个分类
     this.selectCat(Store.cfg.categories[0]);
+    // 云端同步：启动时拉取一次
+    if(Sync.client){ Sync.pullAll().catch(()=>{}); }
     // PWA
     if('serviceWorker' in navigator){
       navigator.serviceWorker.register('sw.js').catch(()=>{});
@@ -1096,10 +1237,21 @@ const App = {
   },
 
   flashSync(){
-    const f = $('#sideFoot');
     $('#syncText').textContent = '正在保存...';
     clearTimeout(this._syncT);
-    this._syncT = setTimeout(()=>{ $('#syncText').textContent = '数据已保存到本地'; }, 800);
+    this._syncT = setTimeout(()=>{
+      $('#syncText').textContent = Sync.client ? '已同步到云端' : '数据已保存到本地';
+    }, 800);
+    // 云端同步（debounce）
+    if(Sync.client){
+      clearTimeout(this._cloudSyncT);
+      this._cloudSyncT = setTimeout(async ()=>{
+        try{
+          await Sync.uploadConfig();
+          $('#syncText').textContent = '已同步到云端';
+        }catch(e){}
+      }, 2000);
+    }
   },
 
   /* ---- 日期导航 ---- */
@@ -1242,14 +1394,25 @@ const App = {
   /* ---- 设置 ---- */
   openSettings(){
     const s = Store.cfg.settings;
+    const syncStatus = s.cloudConnected
+      ? `<div style="background:#e8f5e9;color:#2e7d32;padding:10px 14px;border-radius:12px;font-size:13px;font-weight:600;margin-bottom:12px">✅ 云端已连接 · ${s.lastSyncAt?('上次同步: '+new Date(s.lastSyncAt).toLocaleString('zh-CN')):''}</div>`
+      : `<div style="background:var(--blue-ll);color:var(--ink-s);padding:10px 14px;border-radius:12px;font-size:13px;margin-bottom:12px">当前为本地模式，数据仅存手机本地。填入 Supabase 凭证可启用云端同步。</div>`;
+    
     this.showModal(`
       <div class="modal-head"><h3>设置</h3><button class="icon-btn" onclick="App.closeModal()">${ico('x',20)}</button></div>
       <div class="modal-body">
-        <div class="section-title" style="margin-bottom:10px">${ico('cloud',14)}<span>云端同步（Supabase）</span><span class="line"></span></div>
+        <div class="section-title" style="margin-bottom:10px">${ico('cloud',14)}<span>云端同步</span><span class="line"></span></div>
+        ${syncStatus}
         <div class="field"><label>Supabase Project URL</label><input id="sbUrl" value="${this.esc(s.supabaseUrl||'')}" placeholder="https://xxx.supabase.co"></div>
-        <div class="field"><label>anon public key</label><input id="sbKey" value="${this.esc(s.supabaseKey||'')}" placeholder="eyJ..."></div>
-        <div class="hint" style="margin-bottom:14px">填入凭证后点击"测试连接"即可启用云端同步；留空则使用本地模式。</div>
-        <div class="section-title" style="margin-bottom:10px">${ico('download',14)}<span>数据管理</span><span class="line"></span></div>
+        <div class="field"><label>anon public key</label><textarea id="sbKey" style="min-height:60px;font-size:11px" placeholder="eyJhbGci...">${this.esc(s.supabaseKey||'')}</textarea></div>
+        <div class="hint" style="margin-bottom:10px">① 注册 supabase.com 免费账号 → ② 新建项目 → ③ 在 SQL Editor 执行建表语句 → ④ 在 Settings > API 复制 URL 和 anon key 填入此处</div>
+        <button class="btn btn-ghost" style="width:100%;margin-bottom:12px" onclick="App.showSchema()">${ico('list',14)} 查看建表 SQL（点我复制）</button>
+        ${s.cloudConnected?`
+        <div class="row" style="margin-bottom:10px">
+          <button class="btn btn-ghost" onclick="App.syncUpload()">${ico('upload',14)} 上传到云端</button>
+          <button class="btn btn-ghost" onclick="App.syncDownload()">${ico('download',14)} 从云端拉取</button>
+        </div>`:''}
+        <div class="section-title" style="margin:16px 0 10px">${ico('download',14)}<span>数据管理</span><span class="line"></span></div>
         <div class="row">
           <button class="btn btn-ghost" onclick="App.exportData()">${ico('download',16)} 导出</button>
           <button class="btn btn-ghost" onclick="App.importData()">${ico('upload',16)} 导入</button>
@@ -1257,40 +1420,74 @@ const App = {
         <div style="margin-top:10px"><button class="btn btn-danger" onclick="App.clearData()">清空所有数据</button></div>
       </div>
       <div class="modal-foot">
-        <button class="btn btn-ghost" onclick="App.testCloud()">${s.cloudConnected?'已连接 · 断开':'测试连接'}</button>
-        <button class="btn btn-primary" onclick="App.saveSettings()">保存</button>
+        ${s.cloudConnected?'<button class="btn btn-danger" onclick="App.disconnectCloud()">断开云端</button>':''}
+        <button class="btn btn-ghost" onclick="App.closeModal()">取消</button>
+        <button class="btn btn-primary" onclick="App.connectCloud()">${s.cloudConnected?'保存':'连接云端'}</button>
       </div>
     `);
   },
 
-  async testCloud(){
-    const url = $('#sbUrl').value.trim();
-    const key = $('#sbKey').value.trim();
-    if(Store.cfg.settings.cloudConnected){
-      Store.cfg.settings.cloudConnected = false;
-      Store.save(); this.updateStatus(); this.closeModal(); this.openSettings();
-      toast('已切换为本地模式'); return;
+  showSchema(){
+    const sql = Sync.schemaSQL();
+    if(navigator.clipboard){
+      navigator.clipboard.writeText(sql).then(()=>toast('SQL已复制！去Supabase SQL Editor粘贴执行'));
+    } else {
+      prompt('复制以下SQL，去Supabase SQL Editor执行：', sql);
     }
-    if(!url || !key){ toast('请填写 URL 和 key'); return; }
-    toast('正在测试连接...');
-    try{
-      const r = await fetch(`${url}/rest/v1/`, { headers:{apikey:key, Authorization:`Bearer ${key}`} });
-      if(r.ok || r.status===400 || r.status===404){
-        Store.cfg.settings.cloudConnected = true;
-        Store.cfg.settings.supabaseUrl = url;
-        Store.cfg.settings.supabaseKey = key;
-        Store.save(); this.updateStatus(); this.closeModal(); this.openSettings();
-        toast('云端连接成功');
-      } else { toast('连接失败：HTTP '+r.status); }
-    }catch(e){ toast('连接失败：'+e.message); }
   },
 
-  saveSettings(){
-    Store.cfg.settings.supabaseUrl = $('#sbUrl').value.trim();
-    Store.cfg.settings.supabaseKey = $('#sbKey').value.trim();
+  async connectCloud(){
+    const url = $('#sbUrl').value.trim().replace(/\/$/,'');
+    const key = $('#sbKey').value.trim();
+    if(!url || !key){ toast('请填写 URL 和 key'); return; }
+    toast('正在连接...');
+    Sync.client = { url, key };
+    const ok = await Sync.test();
+    if(ok){
+      Store.cfg.settings.cloudConnected = true;
+      Store.cfg.settings.supabaseUrl = url;
+      Store.cfg.settings.supabaseKey = key;
+      Store.save();
+      this.updateStatus();
+      // 尝试同步
+      toast('连接成功！正在同步数据...');
+      try{
+        await Sync.uploadAll();
+        toast('数据已同步到云端');
+      }catch(e){ toast('连接成功，但同步失败，请先建表'); }
+      this.closeModal();
+    } else {
+      toast('连接失败，请检查 URL 和 key');
+    }
+  },
+
+  disconnectCloud(){
+    Store.cfg.settings.cloudConnected = false;
+    Sync.client = null;
     Store.save();
+    this.updateStatus();
     this.closeModal();
-    toast('设置已保存');
+    this.openSettings();
+    toast('已断开云端，切换为本地模式');
+  },
+
+  async syncUpload(){
+    toast('正在上传...');
+    try{
+      await Sync.uploadAll();
+      this.updateStatus();
+      toast('上传成功！');
+    }catch(e){ toast('上传失败：'+e.message); }
+  },
+
+  async syncDownload(){
+    toast('正在拉取...');
+    try{
+      await Sync.pullAll();
+      this.renderSidebar();
+      this.renderMain();
+      toast('拉取成功！');
+    }catch(e){ toast('拉取失败：'+e.message); }
   },
 
   async exportData(){
